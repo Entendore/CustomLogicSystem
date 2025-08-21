@@ -1,5 +1,7 @@
 import re
 from collections import defaultdict
+import pickle
+import json
 
 # --- Parsing helpers ---
 
@@ -141,6 +143,97 @@ class LogicEngine:
     def __init__(self):
         self.facts = defaultdict(list)  # predicate -> list of tuples
         self.rules = []  # (head_name, head_args, body_parts)
+        self.trace_enabled = False
+
+    def assertz(self, fact_or_rule):
+        """Add a fact or rule at the end"""
+        if ':-' in fact_or_rule:
+            self._parse_rule(fact_or_rule)
+        else:
+            self._parse_fact(fact_or_rule)
+    
+    def asserta(self, fact_or_rule):
+        """Add a fact or rule at the beginning"""
+        if ':-' in fact_or_rule:
+            head, body = map(str.strip, fact_or_rule.split(':-'))
+            head_name, head_args = self._parse_predicate(head)
+            body_parts = [self._parse_predicate(part.strip()) for part in split_args(body)]
+            self.rules.insert(0, (head_name, head_args, body_parts))
+        else:
+            name, args = self._parse_predicate(fact_or_rule)
+            self.facts[name].insert(0, tuple(args))
+    
+    def retract(self, pattern):
+        """Remove facts or rules matching pattern"""
+        name, args = self._parse_predicate(pattern)
+        
+        # Remove facts
+        if name in self.facts:
+            self.facts[name] = [fact for fact in self.facts[name] 
+                               if not all(unify(pattern_arg, fact_arg, {}) 
+                                        for pattern_arg, fact_arg in zip(args, fact))]
+        
+        # Remove rules
+        self.rules = [rule for rule in self.rules 
+                     if not (rule[0] == name and 
+                            all(unify(pattern_arg, rule_arg, {})
+                               for pattern_arg, rule_arg in zip(args, rule[1])))]
+    
+    def query(self, q, max_solutions=None, timeout=None):
+        """Enhanced query with limits"""
+        import time
+        start_time = time.time()
+        solutions_found = 0
+        
+        name, args = self._parse_predicate(q)
+        context = ResolveContext()
+        
+        for result in self._resolve(name, args, {}, context):
+            if timeout and time.time() - start_time > timeout:
+                print("Query timeout reached")
+                break
+            
+            solutions_found += 1
+            yield result
+            
+            if max_solutions and solutions_found >= max_solutions:
+                break
+
+    def stats(self):
+        """Return statistics about the knowledge base"""
+        total_facts = sum(len(facts) for facts in self.facts.values())
+        total_rules = len(self.rules)
+        predicates = list(self.facts.keys()) + [rule[0] for rule in self.rules]
+        
+        return {
+            'total_facts': total_facts,
+            'total_rules': total_rules,
+            'unique_predicates': len(set(predicates)),
+            'predicate_counts': {pred: len(self.facts.get(pred, [])) 
+                                for pred in set(predicates)}
+        }
+
+    def save_state(self, filename):
+        """Save entire engine state to file"""
+        state = {
+            'facts': dict(self.facts),
+            'rules': self.rules,
+            'constraints': self.constraints
+        }
+        with open(filename, 'wb') as f:
+            pickle.dump(state, f)
+    
+    def load_state(self, filename):
+        """Load engine state from file"""
+        with open(filename, 'rb') as f:
+            state = pickle.load(f)
+        self.facts = defaultdict(list, state['facts'])
+        self.rules = state['rules']
+        self.constraints = state['constraints']
+        self.memo.clear()
+
+    def enable_trace(self, enabled=True):
+        self.trace_enabled = enabled
 
     def parse(self, program):
         for line in program.strip().splitlines():
@@ -186,8 +279,34 @@ class LogicEngine:
         results = self._resolve(name, args, {}, context)
         return results
 
-    def _resolve(self, name, args, env, context):
+    def _resolve(self, name, args, env, context, depth=0):
+        if self.trace_enabled:
+            indent = "  " * depth
+            args_str = ", ".join(format_term(a) for a in args)
+            print(f"{indent}TRY: {name}({args_str})")
+
         if context.cut:
+            return
+
+        if name == 'findall' and len(args) == 3:
+            template = args[0]
+            goal = args[1]  # This should be a compound term like ('member', ...)
+            output_var = args[2]
+            
+            if isinstance(goal, tuple) and len(goal) >= 1:
+                solutions = []
+                for result_env in self._resolve(goal[0], goal[1:], env.copy(), context):
+                    solved_template = substitute(template, result_env)
+                    solutions.append(solved_template)
+                
+                # Convert solutions to a list
+                result_list = ('nil',)
+                for solution in reversed(solutions):
+                    result_list = ('cons', solution, result_list)
+                
+                new_env = unify(output_var, result_list, env.copy())
+                if new_env is not None:
+                    yield new_env
             return
 
         # Built-ins
@@ -204,6 +323,94 @@ class LogicEngine:
             val = substitute(args[0], env)
             print(format_term(val))
             yield env
+            return
+        
+        if name == 'maplist' and len(args) >= 2:
+            goal = args[0]
+            input_list = substitute(args[1], env)
+            output_list = args[2] if len(args) > 2 else None
+            
+            def apply_goal_to_list(lst, goal_template):
+                if lst == ('nil',):
+                    return ('nil',)
+                if isinstance(lst, tuple) and lst[0] == 'cons':
+                    head_result = list(self._resolve(goal_template[0], 
+                                                goal_template[1:] + [lst[1]], 
+                                                env.copy(), context))[0]
+                    if head_result:
+                        tail_result = apply_goal_to_list(lst[2], goal_template)
+                        return ('cons', substitute(goal_template[-1], head_result), tail_result)
+                return None
+            
+            result = apply_goal_to_list(input_list, goal)
+            if result and output_list:
+                new_env = unify(output_list, result, env.copy())
+                if new_env is not None:
+                    yield new_env
+            return
+
+        if name == 'is' and len(args) == 2:
+            left = substitute(args[0], env)
+            right = substitute(args[1], env)
+            # Simple arithmetic evaluation
+            if isinstance(right, str) and right.replace('.', '').isdigit():
+                result = float(right) if '.' in right else int(right)
+                new_env = unify(left, result, env.copy())
+                if new_env is not None:
+                    yield new_env
+            return
+
+        if name == 'lt' and len(args) == 2:  # less than
+            left = substitute(args[0], env)
+            right = substitute(args[1], env)
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                if left < right:
+                    yield env
+            return
+
+        if name == 'gt' and len(args) == 2:  # greater than
+            left = substitute(args[0], env)
+            right = substitute(args[1], env)
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                if left > right:
+                    yield env
+            return
+        
+        if name == 'append' and len(args) == 3:
+            list1 = substitute(args[0], env)
+            list2 = substitute(args[1], env)
+            result = substitute(args[2], env)
+            
+            def append_lists(l1, l2):
+                if l1 == ('nil',):
+                    return l2
+                if isinstance(l1, tuple) and l1[0] == 'cons':
+                    return ('cons', l1[1], append_lists(l1[2], l2))
+                return None
+            
+            appended = append_lists(list1, list2)
+            if appended is not None:
+                new_env = unify(result, appended, env.copy())
+                if new_env is not None:
+                    yield new_env
+            return
+
+        if name == 'length' and len(args) == 2:
+            lst = substitute(args[0], env)
+            length_var = args[1]
+            
+            def list_length(l, count=0):
+                if l == ('nil',):
+                    return count
+                if isinstance(l, tuple) and l[0] == 'cons':
+                    return list_length(l[2], count + 1)
+                return None
+            
+            length = list_length(lst)
+            if length is not None:
+                new_env = unify(length_var, length, env.copy())
+                if new_env is not None:
+                    yield new_env
             return
 
         # Negation: not(P)
@@ -238,6 +445,9 @@ class LogicEngine:
             if head_match is None:
                 continue
             yield from self._resolve_body(rule_body, head_match, context)
+
+        if self.trace_enabled and result_found:
+            print(f"{indent}SUCCESS: {name}({args_str})")
 
     def _resolve_body(self, body, env, context):
         if not body or context.cut:
@@ -309,6 +519,38 @@ def repl():
 
     % Check equality with eq/2
     equal_example(X) :- eq(X, alice).
+
+
+    Sudoku solver example
+sudoku(Rows) :- 
+    length(Rows, 9),
+    maplist(same_length(Rows), Rows),
+    maplist(fd_domain(1, 9), Rows),
+    maplist(fd_all_different, Rows),
+    transpose(Rows, Columns),
+    maplist(fd_all_different, Columns),
+    Rows = [A,B,C,D,E,F,G,H,I],
+    blocks(A, B, C), blocks(D, E, F), blocks(G, H, I).
+
+blocks([], [], []).
+blocks([A,B,C|Bs1], [D,E,F|Bs2], [G,H,I|Bs3]) :-
+    fd_all_different([A,B,C,D,E,F,G,H,I]),
+    blocks(Bs1, Bs2, Bs3).
+
+fd_domain(Min, Max, Var) :- between(Min, Max, Var).
+fd_all_different(List) :- is_set(List).
+
+between(Min, Max, Min) :- Min =< Max.
+between(Min, Max, Val) :- Min < Max, Next is Min + 1, between(Next, Max, Val).
+
+transpose([], []).
+transpose([Row|Rows], Cols) :- transpose(Rows, Rest), zip(Row, Rest, Cols).
+
+zip([], [], []).
+zip([X|Xs], [Y|Ys], [(X,Y)|Zs]) :- zip(Xs, Ys, Zs).
+
+is_set([]).
+is_set([H|T]) :- not(member(H, T)), is_set(T).
     """
 
     engine.parse(preload)
@@ -322,6 +564,30 @@ def repl():
 
         line = line.split('%', 1)[0].strip()
         if not line:
+            continue
+        
+        if line.lower() == 'trace on':
+            engine.enable_trace(True)
+            print("Tracing enabled")
+            continue
+            
+        if line.lower() == 'trace off':
+            engine.enable_trace(False)
+            print("Tracing disabled")
+            continue
+            
+        if line.lower() == 'show facts':
+            for pred, facts in engine.facts.items():
+                for fact in facts:
+                    args_str = ', '.join(format_term(a) for a in fact)
+                    print(f"{pred}({args_str}).")
+            continue
+            
+        if line.lower() == 'show rules':
+            for head_name, head_args, body_parts in engine.rules:
+                head_str = f"{head_name}({', '.join(format_term(a) for a in head_args)})"
+                body_str = ', '.join(f"{n}({', '.join(format_term(a) for a in args)})" for n, args in body_parts)
+                print(f"{head_str} :- {body_str}.")
             continue
 
         if line.lower() == 'exit':
@@ -357,23 +623,32 @@ def repl():
         if line.startswith('?-'):
             query_text = line[2:].strip()
             if query_text.endswith('.'):
-                query_text = query_text[:-1].strip()  # remove trailing dot
+                query_text = query_text[:-1].strip()
             try:
                 results = engine.query(query_text)
                 count = 0
-                # Detect variables in query to show bindings
-                has_vars = any(is_variable(v) for v in re.findall(r'\b\w+\b', query_text))
+                
+                # Extract variable names from query for nicer output
+                import re
+                var_names = re.findall(r'\b[A-Z]\w*\b', query_text)
+                var_names = list(set(var_names))  # Remove duplicates
+                
                 for res in results:
-                    if not has_vars:
-                        print("True")
-                        count += 1
-                        break
-                    filtered = {k: substitute(v, res) for k, v in res.items() if is_variable(k)}
-                    if filtered:
-                        print(filtered)
-                        count += 1
+                    count += 1
+                    if not var_names:
+                        print(f"Solution {count}: True")
+                    else:
+                        solution = {}
+                        for var in var_names:
+                            if var in res:
+                                solution[var] = format_term(substitute(res[var], res))
+                        print(f"Solution {count}: {solution}")
+                
                 if count == 0:
-                    print("False")
+                    print("No solutions found.")
+                else:
+                    print(f"Found {count} solution(s).")
+                    
             except Exception as e:
                 print(f"Query error: {e}")
             continue
