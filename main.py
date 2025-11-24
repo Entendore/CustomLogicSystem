@@ -27,8 +27,8 @@ def split_args(text):
 def parse_term(text):
     """Parse a term into internal representation"""
     text = text.strip()
-    # Number parsing
-    if text.replace('.', '').replace('-', '').isdigit():
+    # Number parsing - improved to handle negative numbers and decimals
+    if text.replace('.', '', 1).replace('-', '', 1).isdigit() and (text.count('.') <= 1):
         if '.' in text:
             return float(text)
         else:
@@ -50,7 +50,7 @@ def parse_term(text):
 
 def parse_list(text):
     """Parse list notation into cons/nil representation"""
-    if not text:
+    if not text or text == '':
         return ('nil',)
     if '|' in text:
         head_text, tail_text = map(str.strip, text.split('|', 1))
@@ -100,10 +100,27 @@ def substitute(term, env):
     if isinstance(term, str):
         return env.get(term, term)
     if isinstance(term, tuple):
-        return (term[0], tuple(substitute(t, env) for t in term[1:]))
+        if len(term) == 0:
+            return term
+        return (term[0],) + tuple(substitute(t, env) for t in term[1:])
     return term
 
 # --- Unification ---
+
+def deref(term, env):
+    """Dereference a term through the environment"""
+    while isinstance(term, str) and term in env:
+        term = env[term]
+    return term
+
+def occurs_check(var, term, env):
+    """Check if variable occurs in term (prevents infinite loops)"""
+    term = deref(term, env)
+    if var == term:
+        return True
+    if isinstance(term, tuple):
+        return any(occurs_check(var, t, env) for t in term[1:])
+    return False
 
 def unify(x, y, env):
     """Unify two terms with the given environment"""
@@ -133,6 +150,8 @@ def unify(x, y, env):
         return env
 
     if isinstance(x, tuple) and isinstance(y, tuple):
+        if len(x) == 0 or len(y) == 0:
+            return None
         if x[0] != y[0] or len(x) != len(y):
             return None
         for a, b in zip(x[1:], y[1:]):
@@ -142,21 +161,6 @@ def unify(x, y, env):
         return env
 
     return None
-
-def occurs_check(var, term, env):
-    """Check if variable occurs in term (prevents infinite loops)"""
-    term = deref(term, env)
-    if var == term:
-        return True
-    if isinstance(term, tuple):
-        return any(occurs_check(var, t, env) for t in term[1:])
-    return False
-
-def deref(term, env):
-    """Dereference a term through the environment"""
-    while isinstance(term, str) and term in env:
-        term = env[term]
-    return term
 
 # --- Cut support ---
 
@@ -295,15 +299,43 @@ class LogicEngine:
         """Remove facts or rules matching pattern"""
         name, args = self._parse_predicate(pattern)
         
+        # Remove facts
         if name in self.facts:
-            self.facts[name] = [fact for fact in self.facts[name] 
-                               if not all(unify(pattern_arg, fact_arg, {}) 
-                                        for pattern_arg, fact_arg in zip(args, fact))]
+            original_facts = self.facts[name][:]
+            self.facts[name] = []
+            for fact in original_facts:
+                # Create a copy of the environment for each fact
+                env = {}
+                # Try to unify the pattern with the fact
+                match = True
+                for pattern_arg, fact_arg in zip(args, fact):
+                    result = unify(pattern_arg, fact_arg, env)
+                    if result is None:
+                        match = False
+                        break
+                    env = result
+                if not match:
+                    self.facts[name].append(fact)
         
-        self.rules = [rule for rule in self.rules 
-                     if not (rule[0] == name and 
-                            all(unify(pattern_arg, rule_arg, {})
-                               for pattern_arg, rule_arg in zip(args, rule[1])))]
+        # Remove rules
+        original_rules = self.rules[:]
+        self.rules = []
+        for rule in original_rules:
+            if rule[0] == name and len(rule[1]) == len(args):
+                # Create a copy of the environment for each rule
+                env = {}
+                # Try to unify the pattern with the rule head
+                match = True
+                for pattern_arg, rule_arg in zip(args, rule[1]):
+                    result = unify(pattern_arg, rule_arg, env)
+                    if result is None:
+                        match = False
+                        break
+                    env = result
+                if not match:
+                    self.rules.append(rule)
+            else:
+                self.rules.append(rule)
 
     def clause(self, head, body):
         """Dynamic clause creation and addition"""
@@ -353,8 +385,13 @@ class LogicEngine:
         name, args = self._parse_predicate(q)
         context = ResolveContext()
         
-        for result in self._resolve(name, args, {}, context, 0):
+        def check_timeout():
             if timeout and (datetime.now() - start_time).total_seconds() > timeout:
+                return True
+            return False
+        
+        for result in self._resolve(name, args, {}, context, 0):
+            if check_timeout():
                 print("Query timeout reached")
                 break
             
@@ -478,10 +515,17 @@ class LogicEngine:
             return []
 
         if name == 'not' and len(args) == 1:
-            neg_pred = args[0]
-            for _ in self._resolve(neg_pred[0], neg_pred[1:], env.copy(), context, depth + 1):
-                return []
-            yield env
+            neg_goal = args[0]
+            # Create a new context to avoid affecting the current one
+            neg_context = ResolveContext()
+            # Try to find a solution to the negated goal
+            found_solution = False
+            for _ in self._resolve(neg_goal[0], neg_goal[1:], env.copy(), neg_context, depth + 1):
+                found_solution = True
+                break
+            # If no solution was found, succeed
+            if not found_solution:
+                yield env
             return []
 
         if name == 'cut' and len(args) == 0:
@@ -493,9 +537,8 @@ class LogicEngine:
         if name == 'is' and len(args) == 2:
             left = substitute(args[0], env)
             right = substitute(args[1], env)
-            if isinstance(right, str) and right.replace('.', '').replace('-', '').isdigit():
-                result = float(right) if '.' in right else int(right)
-                new_env = unify(left, result, env.copy())
+            if isinstance(right, (int, float)):
+                new_env = unify(left, right, env.copy())
                 if new_env is not None:
                     yield new_env
             return []
@@ -598,7 +641,7 @@ class LogicEngine:
             result_var = args[2]
             
             solutions = set()
-            for result_env in self._resolve(goal[0], goal[1:], env.copy(), context, depth + 1):
+            for result_env in self._resolve(goal[0], goal[1:], env.copy(), ResolveContext(), depth + 1):
                 solved_template = substitute(template, result_env)
                 solutions.add(format_term(solved_template))
             
@@ -619,7 +662,7 @@ class LogicEngine:
             result_var = args[2]
             
             solutions = []
-            for result_env in self._resolve(goal[0], goal[1:], env.copy(), context, depth + 1):
+            for result_env in self._resolve(goal[0], goal[1:], env.copy(), ResolveContext(), depth + 1):
                 solved_template = substitute(template, result_env)
                 solutions.append(solved_template)
             
@@ -641,7 +684,7 @@ class LogicEngine:
             
             if isinstance(goal, tuple) and len(goal) >= 1:
                 solutions = []
-                for result_env in self._resolve(goal[0], goal[1:], env.copy(), context, depth + 1):
+                for result_env in self._resolve(goal[0], goal[1:], env.copy(), ResolveContext(), depth + 1):
                     solved_template = substitute(template, result_env)
                     solutions.append(solved_template)
                 
@@ -860,6 +903,9 @@ class LogicEngine:
 
 def load_file(engine, filepath):
     """Load facts and rules from a file"""
+    filepath = os.path.expanduser(filepath)
+    filepath = os.path.abspath(filepath)
+    
     if not os.path.exists(filepath):
         print(f"File not found: {filepath}")
         return False
@@ -874,7 +920,7 @@ def load_file(engine, filepath):
         
         # Regular logic file
         engine.parse(content, filepath)
-        engine.loaded_files.add(os.path.abspath(filepath))
+        engine.loaded_files.add(filepath)
         engine.optimize()
         print(f"Loaded {filepath} successfully")
         return True
@@ -923,15 +969,45 @@ def export_knowledge(engine, filepath, format='prolog'):
         if format == 'prolog':
             return save_file(engine, filepath)
         elif format == 'json':
+            def term_to_dict(term):
+                """Convert a term to a JSON-serializable dictionary"""
+                if isinstance(term, (int, float, str)):
+                    return term
+                if isinstance(term, tuple):
+                    if term[0] == 'nil':
+                        return {'type': 'list', 'value': []}
+                    if term[0] == 'cons':
+                        result = []
+                        current = term
+                        while current[0] == 'cons':
+                            result.append(term_to_dict(current[1]))
+                            current = current[2]
+                        return {'type': 'list', 'value': result}
+                    return {
+                        'type': 'compound',
+                        'functor': term[0],
+                        'args': [term_to_dict(arg) for arg in term[1:]]
+                    }
+                return str(term)
+            
             knowledge = {
                 'facts': {
-                    pred: [list(fact) for fact in facts] 
+                    pred: [term_to_dict(fact) for fact in facts] 
                     for pred, facts in engine.facts.items()
                 },
                 'rules': [
                     {
-                        'head': {'name': rule[0], 'args': list(rule[1])},
-                        'body': [{'name': part[0], 'args': list(part[1])} for part in rule[2]]
+                        'head': {
+                            'name': rule[0], 
+                            'args': [term_to_dict(arg) for arg in rule[1]]
+                        },
+                        'body': [
+                            {
+                                'name': part[0], 
+                                'args': [term_to_dict(arg) for arg in part[1]]
+                            } 
+                            for part in rule[2]
+                        ]
                     }
                     for rule in engine.rules
                 ],
@@ -949,6 +1025,46 @@ def export_knowledge(engine, filepath, format='prolog'):
     except Exception as e:
         print(f"Export error: {e}")
         return False
+
+# --- Helper functions ---
+
+def create_example_files():
+    """Create example files if they don't exist"""
+    if not os.path.exists('family.pl'):
+        with open('family.pl', 'w') as f:
+            f.write("""
+% Sample family data
+parent(john, mary).
+parent(mary, susan).
+parent(john, mark).
+parent(mark, alice).
+
+male(john).
+male(mark).
+female(mary).
+female(susan).
+female(alice).
+
+father(X, Y) :- parent(X, Y), male(X).
+mother(X, Y) :- parent(X, Y), female(X).
+""")
+    
+    if not os.path.exists('lists.pl'):
+        with open('lists.pl', 'w') as f:
+            f.write("""
+% List operations
+member(X, [X|_]).
+member(X, [_|T]) :- member(X, T).
+
+append([], L, L).
+append([H|T], L, [H|R]) :- append(T, L, R).
+
+length([], 0).
+length([_|T], N) :- length(T, M), N is M + 1.
+
+sum_list([], 0).
+sum_list([H|T], Sum) :- sum_list(T, Rest), Sum is H + Rest.
+""")
 
 # --- REPL Interface ---
 
@@ -1042,43 +1158,9 @@ def repl():
     engine.parse(preload, "preload")
     engine.optimize()
 
-    # Create example files if they don't exist
-    if not os.path.exists('family.pl'):
-        with open('family.pl', 'w') as f:
-            f.write("""
-% Sample family data
-parent(john, mary).
-parent(mary, susan).
-parent(john, mark).
-parent(mark, alice).
-
-male(john).
-male(mark).
-female(mary).
-female(susan).
-female(alice).
-
-father(X, Y) :- parent(X, Y), male(X).
-mother(X, Y) :- parent(X, Y), female(X).
-""")
+    # Create example files
+    create_example_files()
     
-    if not os.path.exists('lists.pl'):
-        with open('lists.pl', 'w') as f:
-            f.write("""
-% List operations
-member(X, [X|_]).
-member(X, [_|T]) :- member(X, T).
-
-append([], L, L).
-append([H|T], L, [H|R]) :- append(T, L, R).
-
-length([], 0).
-length([_|T], N) :- length(T, M), N is M + 1.
-
-sum_list([], 0).
-sum_list([H|T], Sum) :- sum_list(T, Rest), Sum is H + Rest.
-""")
-
     print("Example files created: family.pl, lists.pl")
     print("Type 'help' for available commands\n")
 
@@ -1320,42 +1402,8 @@ sum_list([H|T], Sum) :- sum_list(T, Rest), Sum is H + Rest.
 # --- Main execution ---
 
 if __name__ == "__main__":
-    # Create example files if they don't exist
-    if not os.path.exists('family.pl'):
-        with open('family.pl', 'w') as f:
-            f.write("""
-% Sample family data
-parent(john, mary).
-parent(mary, susan).
-parent(john, mark).
-parent(mark, alice).
-
-male(john).
-male(mark).
-female(mary).
-female(susan).
-female(alice).
-
-father(X, Y) :- parent(X, Y), male(X).
-mother(X, Y) :- parent(X, Y), female(X).
-""")
-    
-    if not os.path.exists('lists.pl'):
-        with open('lists.pl', 'w') as f:
-            f.write("""
-% List operations
-member(X, [X|_]).
-member(X, [_|T]) :- member(X, T).
-
-append([], L, L).
-append([H|T], L, [H|R]) :- append(T, L, R).
-
-length([], 0).
-length([_|T], N) :- length(T, M), N is M + 1.
-
-sum_list([], 0).
-sum_list([H|T], Sum) :- sum_list(T, Rest), Sum is H + Rest.
-""")
+    # Create example files
+    create_example_files()
     
     # Start the REPL
     repl()
