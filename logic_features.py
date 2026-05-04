@@ -1,10 +1,15 @@
 # logic_features.py
 import logging
-from logic_types import substitute, deref, unify
+from logic_types import substitute, deref, unify, is_variable, Num, Atom, Var, Compound
 
 logger = logging.getLogger("LogicEngine.Features")
 
 class BuiltinHandler:
+    BUILTINS = {
+        'true', 'fail', '!', ';', ',', '->', 'not', 'call', 
+        '=', '\\=', 'is', '>', '<', '>=', '=<', '=:=', '=\=', 'ins'
+    }
+    
     def __init__(self, engine):
         self.engine = engine
         self.constraints = {} 
@@ -13,119 +18,97 @@ class BuiltinHandler:
         self.constraints.clear()
 
     def handle_builtin(self, name, args, env, context, depth):
-        """Dispatches built-in predicates."""
+        if name == 'true': yield env; return
+        if name == 'fail': return
+        if name == '!': context.cut = True; yield env; return
         
-        # 1. Control Flow
-        if name == 'true':
-            yield env
-            return
-        
-        if name == 'fail':
+        if name == ',':
+            if len(args) == 2:
+                for env1 in self.engine._resolve_body((args[0],), env, context, depth+1):
+                    if context.cut: return
+                    yield from self.engine._resolve_body((args[1],), env1, context, depth+1)
             return
 
-        if name == '!': # Cut
-            context.cut = True
-            yield env
+        if name == ';':
+            if len(args) == 2:
+                left, right = args[0], args[1]
+                if isinstance(left, Compound) and left.functor == '->':
+                    cond, then, else_ = left.args[0], left.args[1], right
+                    context.push_cut_scope()
+                    found = False
+                    for env1 in self.engine._resolve_body((cond,), env, context, depth+1):
+                        found = True
+                        yield from self.engine._resolve_body((then,), env1, context, depth+1)
+                        break
+                    cut_occurred = context.pop_cut_scope()
+                    if not found and not cut_occurred:
+                        yield from self.engine._resolve_body((else_,), env, context, depth+1)
+                else:
+                    yield from self.engine._resolve_body((left,), env, context, depth+1)
+                    if context.cut: return
+                    yield from self.engine._resolve_body((right,), env, context, depth+1)
             return
 
-        if name == 'not': # Negation as Failure
-            if len(args) != 1:
-                logger.error("not/1 requires 1 argument")
-                return
-            goal = args[0]
-            found = False
-            try:
-                for _ in self.engine._resolve(goal[0], goal[1], env, context, depth+1):
-                    found = True
+        if name == '->':
+            if len(args) == 2:
+                context.push_cut_scope()
+                for env1 in self.engine._resolve_body((args[0],), env, context, depth+1):
+                    yield from self.engine._resolve_body((args[1],), env1, context, depth+1)
                     break
-            except Exception:
-                pass
-            
-            if not found:
-                yield env
+                context.pop_cut_scope()
+            return
+
+        if name == 'not': 
+            found = any(True for _ in self.engine._resolve_body((args[0],), env, type(context)(), depth+1))
+            if not found: yield env
             return
 
         if name == 'call':
-            if len(args) != 1:
-                return
-            goal = args[0]
-            yield from self.engine._resolve(goal[0], goal[1], env, context, depth+1)
+            yield from self.engine._resolve_body((args[0],), env, context, depth+1)
             return
 
-        # 2. Unification
         if name == '=':
-            if len(args) != 2: return
             res = unify(args[0], args[1], env)
             if res: yield res
             return
 
         if name == '\\=':
-            if len(args) != 2: return
-            res = unify(args[0], args[1], env)
-            if res is None: yield env
+            if unify(args[0], args[1], env) is None: yield env
             return
 
-        # 3. Arithmetic
         if name == 'is':
-            if len(args) != 2: return
             try:
                 val = self._eval_arith(args[1], env)
-                res = unify(args[0], val, env)
+                res = unify(args[0], Num(val), env)
                 if res: yield res
-            except Exception as e:
-                logger.debug(f"Arithmetic error: {e}")
+            except Exception: pass
             return
 
-        # 4. Comparison
         if name in ('>', '<', '>=', '=<', '=:=', '=\='):
-            if len(args) != 2: return
             try:
-                v1 = self._eval_arith(args[0], env)
-                v2 = self._eval_arith(args[1], env)
-                ops = {
-                    '>': lambda a,b: a>b,
-                    '<': lambda a,b: a<b,
-                    '>=': lambda a,b: a>=b,
-                    '=<': lambda a,b: a<=b,
-                    '=:=': lambda a,b: a==b,
-                    '=\=': lambda a,b: a!=b,
-                }
-                if ops[name](v1, v2):
-                    yield env
-            except Exception:
-                pass
-            return
-
-        # 5. CLP(FD) Mock
-        if name == 'ins':
-            yield env
+                v1, v2 = self._eval_arith(args[0], env), self._eval_arith(args[1], env)
+                ops = {'>': a>b, '<': a<b, '>=': a>=b, '=<': a<=b, '=:=': a==b, '=\=': a!=b}
+                if ops[name](v1, v2): yield env
+            except Exception: pass
             return
         
-        if name.startswith('#'):
-            yield env
-            return
-
-        return
+        if name == 'ins': yield env; return
+        if name.startswith('#'): yield env; return
 
     def _eval_arith(self, term, env):
         term = deref(term, env)
-        if isinstance(term, (int, float)):
-            return term
-        if isinstance(term, str):
-            # If it's a variable, it must be bound to a number
-            # But deref handles that. If it's still a string, it's unbound.
-            raise ValueError(f"Unbound variable in arithmetic: {term}")
-        if isinstance(term, tuple):
-            op = term[0]
-            # Handle binary operations: (Op, Left, Right)
-            if len(term) == 3:
-                args = [self._eval_arith(a, env) for a in term[1:]]
-                if op == '+': return args[0] + args[1]
-                if op == '-': return args[0] - args[1]
-                if op == '*': return args[0] * args[1]
-                if op == '/': return args[0] / args[1]
-            # Handle unary minus: ('-', Val)
-            if op == '-' and len(term) == 2:
-                 return -self._eval_arith(term[1], env)
-                 
-        raise ValueError(f"Cannot evaluate: {term}")
+        if isinstance(term, Num): return term.val
+        if isinstance(term, (Var, Atom)): raise ValueError("Unbound variable")
+        if isinstance(term, Compound):
+            op = term.functor
+            if op == '-' and len(term.args) == 1: return -self._eval_arith(term.args[0], env)
+            if len(term.args) == 2:
+                v1, v2 = self._eval_arith(term.args[0], env), self._eval_arith(term.args[1], env)
+                if op == '+': return v1 + v2
+                if op == '-': return v1 - v2
+                if op == '*': return v1 * v2
+                if op == '/': return v1 / v2
+                if op == '//': return int(v1 // v2)
+                if op == 'mod': return v1 % v2
+                if op == '**': return v1 ** v2
+        raise ValueError("Cannot evaluate")

@@ -261,6 +261,7 @@ class MainWindow(QMainWindow):
         
         self.worker_thread.start()
 
+    @Slot(dict)
     def add_solution(self, sol):
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
