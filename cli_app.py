@@ -3,24 +3,22 @@ import cmd
 import sys
 import logging
 from logic_engine import LogicEngine, logger
-# FIX: Import helpers from logic_types, not logic_engine
-from logic_types import format_term, substitute
+from logic_types import format_term
 
-# Custom Formatter for Colored Logs
 class ColorFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
     yellow = "\x1b[33;20m"
     red = "\x1b[31;20m"
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
-    format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
 
     FORMATS = {
-        logging.DEBUG: grey + format + reset,
+        logging.DEBUG: grey + format_str + reset,
         logging.INFO: grey + "%(message)s" + reset,
-        logging.WARNING: yellow + format + reset,
+        logging.WARNING: yellow + format_str + reset,
         logging.ERROR: red + "%(message)s" + reset,
-        logging.CRITICAL: bold_red + format + reset
+        logging.CRITICAL: bold_red + format_str + reset
     }
 
     def format(self, record):
@@ -57,7 +55,7 @@ class LogicShell(cmd.Cmd):
                 count += 1
                 vars = [k for k in res if k[0].isupper()]
                 if vars:
-                    print(f"Solution {count}: { {v: format_term(substitute(v, res)) for v in vars} }")
+                    print(f"Solution {count}: { {v: format_term(res[v]) for v in vars} }")
                 else:
                     print(f"Solution {count}: True")
             if count == 0:

@@ -1,5 +1,6 @@
 # logic_features.py
 import logging
+import operator
 from logic_types import substitute, deref, unify, is_variable, Num, Atom, Var, Compound
 
 logger = logging.getLogger("LogicEngine.Features")
@@ -87,7 +88,10 @@ class BuiltinHandler:
         if name in ('>', '<', '>=', '=<', '=:=', '=\='):
             try:
                 v1, v2 = self._eval_arith(args[0], env), self._eval_arith(args[1], env)
-                ops = {'>': a>b, '<': a<b, '>=': a>=b, '=<': a<=b, '=:=': a==b, '=\=': a!=b}
+                ops = {
+                    '>': operator.gt, '<': operator.lt, '>=': operator.ge, 
+                    '=<': operator.le, '=:=': operator.eq, '=\=': operator.ne
+                }
                 if ops[name](v1, v2): yield env
             except Exception: pass
             return

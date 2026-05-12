@@ -5,9 +5,9 @@ from logic_types import parse_term, split_args, Compound, Atom, Var, Cons, Nil
 
 logger = logging.getLogger("LogicEngine.Parser")
 
-def parse_predicate(text):
+def parse_predicate(text, var_table=None):
     text = text.strip().rstrip('.')
-    term = parse_term(text)
+    term = parse_term(text, var_table)
     if isinstance(term, Compound):
         return term.functor, list(term.args)
     elif isinstance(term, (Atom, Var)):
@@ -49,6 +49,9 @@ def parse_program(program, filename="input"):
         if char in '([': depth += 1
         elif char in ')]': depth -= 1
         elif char == '.' and depth == 0:
+            # Prevent splitting on decimal points for floats (e.g., 3.14)
+            if i > 0 and i < len(text) - 1 and text[i-1].isdigit() and text[i+1].isdigit():
+                continue
             c = text[start:i].strip()
             if c: clauses.append(c)
             start = i + 1
@@ -56,37 +59,53 @@ def parse_program(program, filename="input"):
     for content in clauses:
         try:
             if '-->' in content:
+                # Create a var_table per clause for variable sharing
+                var_table = {}
                 head, body = content.split('-->', 1)
-                h_name, h_args = parse_predicate(head.strip())
-                # FIX: Use raw Var strings for DCG tests matching
-                s_in, s_out = Var('S0'), Var('S')
+                h_name, h_args = parse_predicate(head.strip(), var_table)
+                
+                # Use underscore-prefixed names for DCG internal variables
+                # to avoid conflicts with user variables and to mark them
+                # as anonymous/singleton for output filtering.
+                s_in, s_out = Var('_S0'), Var('_Sn')
                 goals, curr_in = [], s_in
                 
-                for i, gt in enumerate(split_args(body.strip())):
+                body_terms = split_args(body.strip())
+                for i, gt in enumerate(body_terms):
                     gt = gt.strip()
-                    is_last = (i == len(split_args(body.strip())) - 1)
+                    is_last = (i == len(body_terms) - 1)
                     curr_out = s_out if is_last else Var(f"_S{i}")
-                    if gt.startswith('[') and gt.endswith(']'):
-                        word = gt[1:-1].strip()
-                        # FIX: Added missing 'Cons' reference & correct list construction
-                        goals.append(Compound('=', (curr_in, Cons(parse_term(word), curr_out))))
+                    
+                    if gt.startswith('['):
+                        # Parse whole list like [the, a] correctly
+                        list_term = parse_term(gt, var_table)
+                        def append_tail(lst, tail):
+                            if isinstance(lst, Nil): return tail
+                            if isinstance(lst, Var): return tail # Open list support
+                            if isinstance(lst, Cons): return Cons(lst.head, append_tail(lst.tail, tail))
+                            raise ValueError(f"Invalid list term in DCG: {gt}")
+                        full_list = append_tail(list_term, curr_out)
+                        goals.append(Compound('=', (curr_in, full_list)))
                     else:
-                        p = parse_term(gt)
+                        p = parse_term(gt, var_table)
                         g_name = p.name if isinstance(p, (Atom, Var)) else p.functor
                         g_args = () if isinstance(p, (Atom, Var)) else p.args
                         goals.append(Compound(g_name, g_args + (curr_in, curr_out)))
                     curr_in = curr_out
-                rules.append((h_name, (s_in, s_out), goals))
+                rules.append((h_name, tuple(h_args) + (s_in, s_out), goals))
                 
             elif ':-' in content:
+                # Create a var_table per clause for variable sharing
+                var_table = {}
                 head, body = content.split(':-', 1)
-                h_name, h_args = parse_predicate(head.strip())
-                rules.append((h_name, tuple(h_args), flatten_body(parse_term(body.strip()))))
+                h_name, h_args = parse_predicate(head.strip(), var_table)
+                rules.append((h_name, tuple(h_args), flatten_body(parse_term(body.strip(), var_table))))
             else:
-                name, args = parse_predicate(content)
+                var_table = {}
+                name, args = parse_predicate(content, var_table)
                 if name not in facts: facts[name] = []
                 facts[name].append(tuple(args))
         except Exception as e:
-            logger.error(f"Parse error: {e}")
+            logger.error(f"Parse error in '{content}': {e}")
             raise
     return facts, rules

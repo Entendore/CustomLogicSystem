@@ -2,7 +2,7 @@
 import logging
 from collections import defaultdict
 from logic_types import (substitute, unify, is_variable, deref, ResolveContext, 
-                         rename_variables, Atom, Var, Num, format_term)
+                         rename_variables, Atom, Var, Num, Compound, format_term)
 from logic_features import BuiltinHandler
 from logic_parser import parse_program
 
@@ -24,9 +24,9 @@ class LogicEngine:
         self._var_counter = 0
 
     def parse(self, program, filename="input"):
+        # FIX: Merge new facts/rules into existing KB instead of clearing,
+        # enabling incremental additions from CLI
         new_facts, new_rules = parse_program(program, filename)
-        self.facts.clear()
-        self.rules.clear()
         for name, fact_list in new_facts.items():
             self.facts[name].extend(fact_list)
         self.rules.extend(new_rules)
@@ -59,24 +59,12 @@ class LogicEngine:
         for sol in self._resolve(q_name, tuple(q_args), {}, context, 0):
             final_sol = {}
             for a in q_args:
-                if is_variable(a):
+                if is_variable(a) and not a.name.startswith('_'):
                     val = deref(a, sol)
-                    # FIX: Unpack primitive values instead of returning AST nodes
-                    if isinstance(val, Num): 
-                        final_sol[a.name] = val.val
-                    elif isinstance(val, Atom):
-                        final_sol[a.name] = val.name
-                    elif isinstance(val, Var):
-                        final_sol[a.name] = val.name
-                    else:
-                        final_sol[a.name] = format_term(val)
+                    final_sol[a.name] = val
             yield final_sol
             count += 1
             if count >= max_solutions: break
-
-    def _rename_variables(self, term):
-        self._var_counter += 1
-        return rename_variables(term, f"_{self._var_counter}")
 
     def _resolve(self, name, args, env, context, depth):
         if depth > self.max_depth: return
@@ -102,20 +90,55 @@ class LogicEngine:
 
         for rule in self.compiled_rules.get((name, len(args)), []):
             r_name, r_head_args, r_body = rule
-            new_head, new_body = self._rename_variables(r_head_args), self._rename_variables(r_body)
+            
+            # FIX: Generate ONE suffix and ONE rename_table per rule application,
+            # and apply it to every term inside the head tuple and body list!
+            self._var_counter += 1
+            suffix = f"_{self._var_counter}"
+            rename_table = {}  # Shared table preserves variable identity within rule
+            new_head = tuple(rename_variables(a, suffix, rename_table) for a in r_head_args)
+            new_body = [rename_variables(g, suffix, rename_table) for g in r_body]
+            
             match = unify(args, new_head, env)
             if match:
                 base_env = match.copy()
                 for res in self._resolve_body(new_body, match, context, depth + 1):
-                    trail = {k: res[k] for k in res if k in base_env or not k.name.endswith(f"_{self._var_counter}")}
+                    # FIX: Only yield bindings for variables that existed in the
+                    # calling context (base_env) or are original user variables
+                    # (not ending with the renaming suffix).
+                    trail = {}
+                    for k, v in res.items():
+                        if k in base_env or not k.name.endswith(suffix):
+                            trail[k] = v
                     yield trail
+                    if context.cut: break
+                if context.cut: break
 
     def _resolve_body(self, body, env, context, depth):
-        if not body or context.cut: 
+        if not body:
             yield env
             return
+            
         goal, rest = body[0], body[1:]
-        g_name, g_args = (goal.name, ()) if isinstance(goal, (Atom, Var)) else (goal.functor, goal.args)
+        
+        # Handle Variable calls dynamically
+        if isinstance(goal, Var):
+            goal = deref(goal, env)
+            if isinstance(goal, Var): return
+            # Deref'd to a compound/atom - resolve that instead
+            
+        if isinstance(goal, Atom):
+            g_name, g_args = goal.name, ()
+        elif isinstance(goal, Compound):
+            g_name, g_args = goal.functor, goal.args
+        else:
+            return
+            
         for res in self._resolve(g_name, g_args, env, context, depth):
-            if context.cut: return
+            if context.cut:
+                saved_cut = context.cut
+                context.cut = False
+                yield from self._resolve_body(rest, res, context, depth)
+                context.cut = saved_cut
+                return
             yield from self._resolve_body(rest, res, context, depth)

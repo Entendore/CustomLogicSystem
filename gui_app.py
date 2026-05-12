@@ -12,9 +12,8 @@ from PySide6.QtCore import QThread, Signal, QObject, Slot
 from PySide6.QtGui import QColor, QTextCharFormat, QSyntaxHighlighter, QTextDocument
 
 from logic_engine import LogicEngine, logger
-from logic_types import format_term, substitute
+from logic_types import format_term
 
-# --- Basic Syntax Highlighter ---
 class PrologHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,7 +33,6 @@ class PrologHighlighter(QSyntaxHighlighter):
             comment_format.setForeground(QColor("gray"))
             self.setFormat(0, len(text), comment_format)
 
-# --- Qt Logging Handler ---
 class QtLogHandler(QObject, logging.Handler):
     log_signal = Signal(str)
 
@@ -45,7 +43,6 @@ class QtLogHandler(QObject, logging.Handler):
         msg = self.format(record)
         self.log_signal.emit(msg)
 
-# --- Worker Thread ---
 class QueryWorker(QObject):
     finished = Signal()
     error = Signal(str)
@@ -66,7 +63,6 @@ class QueryWorker(QObject):
         finally:
             self.finished.emit()
 
-# --- Main Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -82,19 +78,16 @@ class MainWindow(QMainWindow):
         self.load_examples()
 
     def setup_logging(self):
-        # Clear existing handlers to avoid duplicates or invalid handles
         logger.handlers.clear()
         
-        # 1. Console Handler (Safe check for stdout)
         if sys.stdout and hasattr(sys.stdout, 'write'):
             try:
                 ch = logging.StreamHandler(sys.stdout)
                 ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
                 logger.addHandler(ch)
             except Exception:
-                pass # Ignore if stdout is invalid
+                pass
 
-        # 2. Qt GUI Handler
         self.qt_handler = QtLogHandler()
         self.qt_handler.log_signal.connect(self.append_log)
         self.qt_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s', "%H:%M:%S"))
@@ -176,7 +169,6 @@ class MainWindow(QMainWindow):
         self.test_output.clear()
         self.test_output.append("Starting Pytest Discovery...\n")
         
-        # Check if pytest is available
         try:
             import pytest
         except ImportError:
@@ -184,25 +176,17 @@ class MainWindow(QMainWindow):
             self.test_output.append("Please install it using: pip install pytest")
             return
 
-        # Capture stdout/stderr to a buffer to avoid WinError 6
-        # and to display results in the GUI.
         buffer = io.StringIO()
+        exit_code = 1  # Default to failure
         
-        # We need to temporarily redirect stdout/stderr for the pytest run
-        # to capture prints and logging output that goes to console.
         try:
-            # Use contextlib to safely redirect streams
             with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-                # Run pytest programmatically
-                # -v: verbose
                 exit_code = pytest.main(["-v", "tests/"])
         except Exception as e:
             buffer.write(f"\n<font color='red'>Error running tests: {e}</font>\n")
-            # If pytest crashes hard, we still want to show the error
             import traceback
             traceback.print_exc(file=buffer)
             
-        # Display output
         output_text = buffer.getvalue()
         self.test_output.append(output_text)
         
@@ -245,7 +229,10 @@ class MainWindow(QMainWindow):
             logger.error(f"KB Update Failed: {e}")
 
     def run_query(self):
-        q = self.query_inp.text().strip().lstrip('?-').rstrip('.')
+        q = self.query_inp.text().strip()
+        if q.startswith('?-'):
+            q = q[2:]
+        q = q.strip().rstrip('.')
         if not q: return
         
         self.results_table.setRowCount(0)
@@ -265,7 +252,9 @@ class MainWindow(QMainWindow):
     def add_solution(self, sol):
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
-        text = ", ".join(f"{k}={format_term(substitute(k, sol))}" for k in sol if k[0].isupper())
+        text = ", ".join(f"{k}={format_term(sol[k])}" for k in sol if k[0].isupper())
+        if not text:
+            text = "True"
         self.results_table.setItem(row, 0, QTableWidgetItem(text))
 
     def cleanup_thread(self):

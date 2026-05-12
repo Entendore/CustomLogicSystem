@@ -17,7 +17,7 @@ def main():
         stcli.main()
     else:
         # Import and run the CLI
-        from cli_app import cli_mode
+        from CustomLogicSystem.old.cli_app import cli_mode
         sys.argv = ["logic_system"] + remaining
         cli_mode()
 
